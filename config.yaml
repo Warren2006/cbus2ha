@@ -20,6 +20,7 @@ options:
     mqtt_password: ""
     mqtt_use_tls: false
     mqtt_port: 0
+    lighting_events: false
   # CBUS Connection Configuration
   cbus:
     cbus_connection_type: "tcp"
@@ -40,6 +41,7 @@ schema:
     mqtt_password: password
     mqtt_use_tls: bool?
     mqtt_port: int(0,65535)?
+    lighting_events: bool?
   # CBUS Connection Configuration
   cbus:
     cbus_connection_type: list(tcp|serial)

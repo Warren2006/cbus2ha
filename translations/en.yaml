@@ -18,6 +18,9 @@ configuration:
       mqtt_port:
         name: "MQTT Port"
         description: "Custom MQTT port (0 = use defaults: 1883 for non-TLS, 8883 for TLS)"
+      lighting_events:
+        name: "Lighting Command Events"
+        description: "Publish received Application 56 commands to cbus/events/lighting/<group> (not retained, disabled by default)"
   cbus:
     name: "CBUS Connection Configuration"
     description: "CBUS connection configuration for the CBus to Home Assistant bridge"

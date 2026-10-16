@@ -27,8 +27,16 @@ This fork includes extensive enhancements for Home Assistant:
 - **Color Mode Support**: Proper `color_mode` implementation for dimmable and non-dimmable lights
 - **Ramp-Down Fix**: Fixed transition time handling for lights ramping to off
 - **Enhanced Logging**: Comprehensive queue system logging for debugging
+- **Optional Lighting Command Events**: Non-retained Application 56 ON, OFF,
+  RAMP and TERMINATE RAMP events. Disabled by default; see
+  [configuration, automation examples and safe fork testing](docs/lighting-events.md).
 
 ## Installation
+
+For the lighting events feature in `Warren2006/cbus2ha`, read the
+[fork deployment and rollback procedure](docs/lighting-events.md#safe-testing-deployment-and-rollback)
+before installing. The historical installation links below point to
+`wazza-aus/cbus2ha`, not this fork.
 
 [![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/wazza-aus/cbus2ha)
 

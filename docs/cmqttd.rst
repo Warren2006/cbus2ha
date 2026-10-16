@@ -157,6 +157,14 @@ One of these *must* be specified:
 MQTT options
 ------------
 
+.. option:: --lighting-events
+
+    Publish received Lighting Application 56 commands to
+    ``cbus/events/lighting/<group>`` with QoS 1 and retain disabled.
+    Disabled by default. See the repository's `lighting events guide
+    <https://github.com/Warren2006/cbus2ha/blob/master/docs/lighting-events.md>`_
+    for payloads, automations and safe deployment.
+
 .. option:: --broker-address ADDR
 
     Address of the MQTT broker. This option is required.
@@ -414,6 +422,12 @@ __ https://en.wikipedia.org/wiki/Coordinated_Universal_Time
     By default, this will be sent every 300 seconds (5 minutes).
 
     This is equivalent to :option:`cmqttd --timesync`.
+
+.. envvar:: CBUS_LIGHTING_EVENTS
+
+    Set to ``1`` to enable :option:`cmqttd --lighting-events` in
+    :file:`entrypoint-cmqttd.sh`. Default: ``0`` (disabled).
+    The Home Assistant add-on uses ``mqtt.lighting_events`` instead.
 
 The image is configured to read additional files from :file:`/etc/cmqttd`, if present. Use
 `Docker volume mounts`__ to make the following files available:

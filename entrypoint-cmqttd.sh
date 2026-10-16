@@ -22,6 +22,10 @@ CMQTTD_PROJECT_FILE="/etc/cmqttd/project.cbz"
 # Arguments that are always required.
 CMQTTD_ARGS="--broker-address ${MQTT_SERVER:?unset} --timesync ${CBUS_TIMESYNC:-300}"
 
+if [ "${CBUS_LIGHTING_EVENTS:-0}" = "1" ]; then
+    CMQTTD_ARGS="${CMQTTD_ARGS} --lighting-events"
+fi
+
 # Simple arguments
 if [ -n "${MQTT_PORT}" ]; then
     CMQTTD_ARGS="${CMQTTD_ARGS} --broker-port ${MQTT_PORT}"

@@ -14,6 +14,7 @@ MQTT_USERNAME=$(jq -r '.mqtt.mqtt_username // ""' $CONFIG_PATH)
 MQTT_PASSWORD=$(jq -r '.mqtt.mqtt_password // ""' $CONFIG_PATH)
 MQTT_USE_TLS=$(jq -r '.mqtt.mqtt_use_tls // false' $CONFIG_PATH)
 MQTT_PORT=$(jq -r '.mqtt.mqtt_port // 0' $CONFIG_PATH)
+LIGHTING_EVENTS=$(jq -r '.mqtt.lighting_events // false' $CONFIG_PATH)
 CBUS_CONNECTION_TYPE=$(jq -r '.cbus.cbus_connection_type // "tcp"' $CONFIG_PATH)
 CBUS_CONNECTION_STRING=$(jq -r '.cbus.cbus_connection_string // "192.168.1.50:10001"' $CONFIG_PATH)
 CBUS_TIMESYNC=$(jq -r '.cbus.cbus_timesync // 300' $CONFIG_PATH)
@@ -37,6 +38,10 @@ fi
 
 # Build command arguments
 CMQTTD_ARGS="--broker-address ${MQTT_BROKER}"
+
+if [ "${LIGHTING_EVENTS}" = "true" ]; then
+    CMQTTD_ARGS="${CMQTTD_ARGS} --lighting-events"
+fi
 
 # MQTT Port
 if [ "${MQTT_PORT}" -gt 0 ]; then
