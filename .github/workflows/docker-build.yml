@@ -1,0 +1,34 @@
+name: Docker build
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build amd64 image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --progress=plain \
+            --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19 \
+            --tag cbus2ha-event-test:local .
+      - name: Offline smoke test
+        shell: bash
+        run: |
+          help_output="$(docker run --rm --network none \
+            --entrypoint python3 cbus2ha-event-test:local \
+            -m cbus.daemon.cmqttd --help)"
+          printf '%s\n' "$help_output"
+          grep -F -- '--lighting-events' <<< "$help_output"
