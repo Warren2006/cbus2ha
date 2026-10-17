@@ -1,6 +1,6 @@
-name: "CBus to Home Assistant"
+name: "CBus to Home Assistant (Event Test)"
 description: "Bridges Clipsal CBus system to Home Assistant via MQTT"
-version: "1.0.3"
+version: "1.0.4b1"
 slug: cbus2ha
 arch:
   - aarch64
@@ -10,7 +10,8 @@ arch:
   - i386
 init: false
 startup: application
-boot: auto
+boot: manual_only
+stage: experimental
 host_network: true
 options:
   # MQTT Configuration
