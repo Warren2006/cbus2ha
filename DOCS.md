@@ -48,6 +48,15 @@ Custom MQTT port. Set to `0` to use defaults:
 - `1883` for non-TLS connections
 - `8883` for TLS connections
 
+#### Lighting Command Events
+Set `mqtt.lighting_events: true` to publish received C-Bus Lighting Application
+56 ON, OFF, RAMP and TERMINATE RAMP commands to `cbus/events/lighting/<group>`.
+Default: `false`. Events use QoS 1 and are never retained. Ignored groups can
+still produce events; existing state and discovery publishing are unchanged.
+
+See [Lighting command events](docs/lighting-events.md) for payloads, Home
+Assistant automations, delivery limitations and safe fork deployment/rollback.
+
 #### C-Bus Time Sync
 Interval (in seconds) to send time synchronization packets to the C-Bus network. Set to `0` to disable. Default: `300` (5 minutes)
 

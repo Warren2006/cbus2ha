@@ -48,6 +48,7 @@ _TOPIC_SET_SUFFIX = '/set'
 _TOPIC_CONF_SUFFIX = '/config'
 _TOPIC_STATE_SUFFIX = '/state'
 _META_TOPIC = 'homeassistant/binary_sensor/cbus_cmqttd'
+_LIGHTING_EVENT_TOPIC_PREFIX = 'cbus/events/lighting/'
 
 # Device type constants
 _DEVICE_TYPE_LIGHT = 'light'
@@ -161,12 +162,13 @@ class CBusHandler(PCIProtocol):
 
     def __init__(self, labels: Optional[Dict[int, Text]], 
                  device_types: Optional[Dict[int, str]] = None, 
-                 *args, **kwargs):
+                 *args, lighting_events: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.labels = (
             labels if labels is not None else {})  # type: Dict[int, Text]
         self.device_types = (
             device_types if device_types is not None else {})  # type: Dict[int, str]
+        self.lighting_events = lighting_events
         
         # Queue system
         self.command_queue = Queue()  # FIFO queue for new commands
@@ -178,9 +180,23 @@ class CBusHandler(PCIProtocol):
         self._queue_running = False
 
 
+    def _publish_lighting_event(self, event, source_addr, group_addr, **kwargs):
+        # Only inbound callbacks use this path, never queued HA commands or
+        # confirmation-driven state updates. A missing source is not a bus event.
+        if not self.lighting_events or not self.mqtt_api or source_addr is None:
+            return
+        try:
+            self.mqtt_api.publish_lighting_event(
+                event, source_addr, group_addr, **kwargs)
+        except Exception:
+            # An optional event failure must not interrupt normal state handling.
+            logger.exception('Could not publish lighting command event')
+
     def on_lighting_group_ramp(self, source_addr, group_addr, duration, level):
         if not self.mqtt_api:
             return
+        self._publish_lighting_event(
+            'ramp', source_addr, group_addr, duration=duration, level=level)
         device_type = get_device_type(group_addr, self.device_types)
         
         # Log but don't publish for ignored devices
@@ -194,6 +210,7 @@ class CBusHandler(PCIProtocol):
     def on_lighting_group_on(self, source_addr, group_addr):
         if not self.mqtt_api:
             return
+        self._publish_lighting_event('on', source_addr, group_addr)
         device_type = get_device_type(group_addr, self.device_types)
         
         # Log but don't publish for ignored devices
@@ -206,6 +223,7 @@ class CBusHandler(PCIProtocol):
     def on_lighting_group_off(self, source_addr, group_addr):
         if not self.mqtt_api:
             return
+        self._publish_lighting_event('off', source_addr, group_addr)
         device_type = get_device_type(group_addr, self.device_types)
         
         # Log but don't publish for ignored devices
@@ -215,7 +233,9 @@ class CBusHandler(PCIProtocol):
         
         self.mqtt_api.lighting_group_off(source_addr, group_addr, device_type)
 
-    # TODO: on_lighting_group_terminate_ramp
+    def on_lighting_group_terminate_ramp(self, source_addr, group_addr):
+        # This command contains no brightness measurement. Leave HA state alone.
+        self._publish_lighting_event('terminate_ramp', source_addr, group_addr)
 
     def on_clock_request(self, source_addr):
         self.clock_datetime()
@@ -660,6 +680,23 @@ class MqttClient(mqtt.Client):
         payload = json.dumps(payload)
         return super().publish(topic, payload, 1, True)
 
+    def publish_lighting_event(self, event: str, source_addr: int,
+                               group_addr: int, duration: Optional[int] = None,
+                               level: Optional[int] = None):
+        """Publish an observed Application 56 command, without retaining it."""
+        payload = {
+            'event': event,
+            'source_unit': source_addr,
+            'group': group_addr,
+            'application': int(Application.LIGHTING),
+        }
+        if event == 'ramp':
+            payload.update(level=level, duration=duration)
+        # Do not use self.publish(): discovery and state intentionally retain.
+        return super().publish(
+            _LIGHTING_EVENT_TOPIC_PREFIX + str(group_addr),
+            json.dumps(payload), qos=1, retain=False)
+
     def publish_all_lights(self, labels: Dict[int, Text], 
                           device_types: Dict[int, str]):
         """Publishes configuration for all devices based on their types."""
@@ -939,6 +976,12 @@ async def _main():
 
     group = parser.add_argument_group('MQTT options')
     group.add_argument(
+        '--lighting-events',
+        action='store_true', default=False,
+        help='Publish received Application 56 commands to cbus/events/lighting/'
+             '<group> (QoS 1, not retained). Disabled by default.')
+
+    group.add_argument(
         '-b', '--broker-address',
         required=True,
         help='Address of the MQTT broker')
@@ -1101,6 +1144,7 @@ async def _main():
             connection_lost_future=connection_lost_future,
             labels=labels,
             device_types=device_types,
+            lighting_events=option.lighting_events,
         )
 
     if option.serial:
