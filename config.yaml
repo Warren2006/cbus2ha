@@ -1,6 +1,6 @@
 name: "CBus to Home Assistant"
 description: "Bridges Clipsal CBus system to Home Assistant via MQTT"
-version: "1.0.4"
+version: "1.0.5-rc1"
 slug: cbus2ha
 arch:
   - aarch64
@@ -26,6 +26,7 @@ options:
     cbus_connection_type: "tcp"
     cbus_connection_string: "192.168.1.50:10001"
     cbus_timesync: 300
+    link_check_interval: 60
     project_file_path: ""
   # CBUS Group Address Modifiers
   ga:
@@ -47,6 +48,7 @@ schema:
     cbus_connection_type: list(tcp|serial)
     cbus_connection_string: str
     cbus_timesync: int(0,)?
+    link_check_interval: int(0,)?
     project_file_path: str?
   # CBUS Group Address Modifiers
   ga:

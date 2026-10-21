@@ -48,7 +48,7 @@ from cbus.protocol.cbus_protocol import CBusProtocol
 from cbus.protocol.confirm_packet import ConfirmationPacket
 from cbus.protocol.dm_packet import DeviceManagementPacket
 from cbus.protocol.error_packet import PCIErrorPacket
-# from cbus.protocol.po_packet import PowerOnPacket
+from cbus.protocol.po_packet import PowerOnPacket
 from cbus.protocol.pm_packet import PointToMultipointPacket
 from cbus.protocol.pp_packet import PointToPointPacket
 from cbus.protocol.reset_packet import ResetPacket
@@ -79,6 +79,7 @@ class PCIProtocol(CBusProtocol):
         self._timesync_frequency = timesync_frequency
         self._connection_lost_future = connection_lost_future
         self._handle_clock_requests = bool(handle_clock_requests)
+        self._timesync_task = None
 
     def connection_made(self, transport: WriteTransport) -> None:
         """
@@ -90,11 +91,23 @@ class PCIProtocol(CBusProtocol):
         self._transport = transport
         self.pci_reset()
         if self._timesync_frequency:
-            create_task(self.timesync())
+            self._timesync_task = create_task(self.timesync())
+            self._timesync_task.add_done_callback(self._timesync_finished)
+
+    def _timesync_finished(self, task):
+        if not task.cancelled() and task.exception() is not None:
+            logger.error('C-Bus time synchronisation failed',
+                         exc_info=task.exception())
+            if self._transport is not None:
+                self._transport.abort()
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
         self._transport = None
-        self._connection_lost_future.set_result(True)
+        if self._timesync_task is not None:
+            self._timesync_task.cancel()
+        if (self._connection_lost_future is not None
+                and not self._connection_lost_future.done()):
+            self._connection_lost_future.set_result(True)
 
     def handle_cbus_packet(self, p: BasePacket) -> None:
         """
@@ -106,6 +119,8 @@ class PCIProtocol(CBusProtocol):
                 self.on_pci_cannot_accept_data()
             elif isinstance(p, ConfirmationPacket):
                 self.on_confirmation(p.code, p.success)
+            elif isinstance(p, PowerOnPacket):
+                self.on_pci_power_up()
             else:
                 logger.debug(f'hcp: unhandled SpecialServerPacket: {p!r}')
         elif isinstance(p, PointToMultipointPacket):
