@@ -14,7 +14,14 @@ Candidate: 1.0.5-rc1, branch `reliability/v1.0.4-connection-recovery`, based on
 | CLI help / Python compilation / shell syntax / `git diff --check` | PASS |
 | Existing add-on file-presence validator | PASS; this validator does not validate Supervisor runtime semantics |
 | Local exact production Dockerfile build | **Blocked** at Alpine package indexes: `dl-cdn.alpinelinux.org` denied by development network policy |
-| GitHub Actions | PR adds full unit matrix (Paho 1.5.0 and 1.6.1 on Python 3.11), Docker build and loopback failure tests; check the PR's current status |
+| GitHub Actions, application commit `61ea307` | **All four jobs passed**: Paho 1.5.0 and 1.6.1 unit matrix on Python 3.11, exact Docker build/offline smoke and 11 loopback integration tests |
+
+The successful remote validation is
+[run 39546043471](https://github.com/Warren2006/cbus2ha/actions/runs/39546043471).
+The image package logs confirm Python 3.11.14, Paho 1.6.1-r2, pyserial 3.5-r6 and
+serial-asyncio 0.6. This verifies the candidate build, not the exact production
+image currently installed. Subsequent documentation-only commits leave that
+tested application code unchanged; check the PR for checks on its latest head.
 
 The failed local image build fetched base
 `ghcr.io/home-assistant/amd64-base:3.19@sha256:064e13687f5d2b839c2f7304ae57c71fed4d60f5311e8c8b11ae75fa32c11c6f`,

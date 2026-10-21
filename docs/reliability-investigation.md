@@ -43,6 +43,27 @@ multi-application implementation and must not be assumed to be the image source.
 This inspected amd64 image is not proof of the architecture, tag or immutable
 digest used in the former installation. Other architectures remain uninspected.
 
+### Runtime verification after implementation
+
+The unchanged production Dockerfile was successfully built by
+[GitHub Actions run 39546043471](https://github.com/Warren2006/cbus2ha/actions/runs/39546043471)
+for application commit `61ea3079b1face33a6461c8d910174ff42d7f0ca`. Its package
+installation logs show Python **3.11.14**, Paho **1.6.1-r2**, pyserial **3.5-r6**
+and pip-installed pyserial-asyncio **0.6**, on the configured Alpine 3.19 base.
+Those dependency versions were built from the same Dockerfile as v1.0.4;
+they are not evidence of the exact image currently installed on the user's host.
+
+Production, upstream and Abnormaliti have identical `Dockerfile`,
+`requirements-cmqttd.txt`, `requirements.txt` and `setup.py` Git blobs.
+The requirements files' Paho 1.5.0/serial-asyncio 0.4 pins do **not** describe
+that image build: the Dockerfile installs APK packages plus serial-asyncio 0.6,
+and setup.py uses `requires`, not pip's `install_requires`. Thus the historical
+image and the newly verified build both use Paho 1.6.1 and serial-asyncio 0.6.
+Blaming a nominal Paho 1.5-versus-1.6 downgrade on the basis of the requirements
+file would be unsupported. Python/base-image versions and application behavior
+differ; the installed production runtime still needs its own digest/version
+capture. The local legacy test environment deliberately exercises Paho 1.5.0 too.
+
 ## Architectural comparison and source evidence
 
 All four relevant daemons use asyncio PCIProtocol and Paho MQTT. Production,
