@@ -34,6 +34,9 @@ configuration:
       cbus_timesync:
         name: "Time Sync Interval"
         description: "Interval in seconds to sync time with C-Bus network (0 = disabled, default: 300)"
+      link_check_interval:
+        name: "Connection Check Interval"
+        description: "Seconds between read-only interface checks (default: 60; 0 disables). Two unanswered checks trigger reconnection."
       project_file_path:
         name: "Project File Path"
         description: "Optional path to C-Bus Toolkit project file (.cbz) for custom device labels"

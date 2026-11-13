@@ -26,26 +26,37 @@ This fork includes extensive enhancements for Home Assistant:
 - **Improved MQTT Discovery**: Better state management and Home Assistant 2025.3+ compatibility
 - **Color Mode Support**: Proper `color_mode` implementation for dimmable and non-dimmable lights
 - **Ramp-Down Fix**: Fixed transition time handling for lights ramping to off
-- **Enhanced Logging**: Comprehensive queue system logging for debugging
+- **Enhanced Logging**: Comprehensive command-queue logging for debugging
+- **Connection Recovery (v1.0.5)**: Independent MQTT and C-Bus reconnection, read-only PCI health checks, and automatic restoration of MQTT subscriptions and observed states
+- **Recovery Safety and Diagnostics (v1.0.5)**: Bounded queues, cleanup of stale connection tasks, connection/retry warnings, and five-minute bridge health reports
 - **Optional Lighting Command Events**: Non-retained Application 56 ON, OFF,
   RAMP and TERMINATE RAMP events. Disabled by default; see
   [configuration, automation examples and safe fork testing](docs/lighting-events.md).
 
+## Connection reliability improvements (v1.0.5)
+
+Version **1.0.5** adds self-healing MQTT and C-Bus connections compared with v1.0.4. It reconnects to the C-Bus interface after two unanswered PCI health probes, recovers from TCP socket loss, and restores MQTT subscriptions/discovery after a broker outage. The existing optional, non-retained physical C-Bus lighting command events are preserved; reconnecting does **not** generate synthetic button events.
+
+**Field observations, 8–13 November 2026:** Synology syslog exports from a recovery-enabled Home Assistant add-on showed 1,501/1,501 healthy periodic bridge reports, 87 first-stage PCI probe failures, four watchdog-initiated C-Bus recoveries, and 20 command-confirmation timeouts. The operator reported no need to restart Home Assistant to restore C-Bus during this period. These observations support the recovery mechanism, but do not establish the cause of the intermittent C-Bus/CNI communication problems or independently verify the deployed image digest against the branch commit.
+
+The changes and test results are documented in [pull request #2](https://github.com/Warren2006/cbus2ha/pull/2), with [validation details](docs/reliability-validation.md) and [operations and rollback guidance](docs/reliability-operation.md). The original v1.0.4 baseline is preserved on the [rollback branch](https://github.com/Warren2006/cbus2ha/tree/rollback/v1.0.4-7dd4d50).
+
 ## Installation
 
-For the lighting events feature in `Warren2006/cbus2ha`, read the
-[fork deployment and rollback procedure](docs/lighting-events.md#safe-testing-deployment-and-rollback)
-before installing. The historical installation links below point to
-`wazza-aus/cbus2ha`, not this fork.
+For installation or upgrades, read the
+[deployment and rollback guidance](docs/reliability-operation.md)
+and [lighting events notes](docs/lighting-events.md) first. The button and manual
+instructions below point to the stable `Warren2006/cbus2ha` repository on `master`.
+**Do not run two C-Bus bridge instances against the same CNI or MQTT topics.**
 
-[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/wazza-aus/cbus2ha)
+[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/Warren2006/cbus2ha)
 
 Click the button above to add this repository to your Home Assistant instance. If the button doesn't work, you can manually add the repository:
 
 1. In Home Assistant, go to **Settings** → **Add-ons** → **Add-on Store**
 2. Click the three dots (⋮) in the top right corner
 3. Select **Repositories**
-4. Add the following URL: `https://github.com/wazza-aus/cbus2ha`
+4. Add the following URL: `https://github.com/Warren2006/cbus2ha`
 5. Click **Add**, then **Close**
 6. The "C-Bus to Home Assistant (cbus2ha)" addon should now appear in the addon store
 7. Click on it and select **Install**

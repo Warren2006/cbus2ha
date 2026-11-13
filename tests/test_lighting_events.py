@@ -3,7 +3,7 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from parameterized import parameterized
 
@@ -153,7 +153,7 @@ class LightingEventsTest(PublicationMixin, unittest.TestCase):
 
     def test_virtual_ignored_group_has_events_without_entities_or_state(self):
         handler, client = self.make_bridge(device_types={200: 'ignore'})
-        with patch.object(client, 'subscribe'), patch.object(handler, 'start_queue_system'):
+        with patch.object(client, 'subscribe', return_value=(0, 1)):
             client.on_connect(client, handler, {}, 0)
         discovery = self.publications()
         self.assertEqual(len(discovery), 256)  # Meta-device plus 255 normal groups.
@@ -180,7 +180,7 @@ class LightingEventsTest(PublicationMixin, unittest.TestCase):
         self.assertTrue(all(p[2:] == (1, True) for p in snapshots[0]))
 
     def test_reconnect_and_state_publishing_never_emit_command_events(self):
-        with patch.object(self.client, 'subscribe'), patch.object(self.handler, 'start_queue_system'):
+        with patch.object(self.client, 'subscribe', return_value=(0, 1)):
             for _ in range(2):
                 self.client.on_connect(self.client, self.handler, {}, 0)
         self.client.lighting_group_on(None, 200)
@@ -191,7 +191,7 @@ class LightingEventsTest(PublicationMixin, unittest.TestCase):
     def test_packets_before_mqtt_ready_are_not_replayed_on_connect(self):
         self.handler.mqtt_api = None
         self.handler.data_received(inbound_packet(b'\x79\xc8\x09\xc8'))
-        with patch.object(self.client, 'subscribe'), patch.object(self.handler, 'start_queue_system'):
+        with patch.object(self.client, 'subscribe', return_value=(0, 1)):
             self.client.on_connect(self.client, self.handler, {}, 0)
         self.assertEqual(self.publications(events=True), [])
 
@@ -277,7 +277,7 @@ class LightingEventsQueueTest(PublicationMixin, unittest.IsolatedAsyncioTestCase
             self.handler._queue_running = False
 
         with patch.object(cmqttd, 'sleep', side_effect=one_iteration), \
-                patch.object(cmqttd.time, 'time', return_value=2):
+                patch.object(cmqttd.time, 'monotonic', return_value=2):
             await self.handler._timeout_watchdog()
         self.assertEqual(list(self.handler.retry_queue), [queued])
         self.assertEqual(queued.retry_count, 1)
@@ -305,11 +305,16 @@ class LightingEventsQueueTest(PublicationMixin, unittest.IsolatedAsyncioTestCase
         handlers = []
         loop = asyncio.get_running_loop()
 
-        async def connect(factory, _host, _port):
+        async def supervise(factory, connect, _client):
             handler = factory()
             handlers.append(handler)
-            handler._connection_lost_future.set_result(True)
-            return Mock(), handler
+            await connect(lambda: handler)
+
+        async def connect(factory, _host, _port):
+            return Mock(), factory()
+
+        def start(client, *_args):
+            client.network_failure = loop.create_future()
 
         argv = ['cmqttd', '--broker-address', 'example.invalid',
                 '--broker-disable-tls', '--tcp', '192.0.2.1:10001']
@@ -317,9 +322,11 @@ class LightingEventsQueueTest(PublicationMixin, unittest.IsolatedAsyncioTestCase
             argv.append('--lighting-events')
         with patch('sys.argv', argv), \
                 patch.object(loop, 'create_connection', side_effect=connect), \
-                patch.object(cmqttd, 'MqttClient'), \
-                patch.object(cmqttd, 'AsyncioHelper'), \
+                patch.object(cmqttd, 'maintain_cbus_connection', side_effect=supervise), \
+                patch.object(cmqttd.MqttClient, 'start', start), \
+                patch.object(cmqttd.MqttClient, 'stop', new_callable=AsyncMock), \
                 patch.object(cmqttd.logging, 'basicConfig'):
-            await cmqttd._main()
+            with self.assertRaisesRegex(RuntimeError, 'supervisor stopped'):
+                await cmqttd._main()
         self.assertEqual(len(handlers), 1)
         self.assertEqual(handlers[0].lighting_events, enabled)

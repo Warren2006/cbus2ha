@@ -16,12 +16,16 @@
 # along with this library.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
-from asyncio import get_event_loop, run, Queue, QueueEmpty, create_task, sleep
+from asyncio import (
+    get_event_loop, run, Queue, QueueEmpty, QueueFull, create_task, sleep)
 from argparse import ArgumentParser, FileType
 from collections import deque
 from dataclasses import dataclass, field
+import faulthandler
 import json
 import logging
+import signal
+import threading
 import time
 from typing import Any, BinaryIO, Dict, Optional, Text, TextIO
 
@@ -33,9 +37,12 @@ except ImportError:
     async def create_serial_connection(*_, **__):
         raise ImportError('Serial device support requires pyserial-asyncio')
 
-from cbus.common import MIN_GROUP_ADDR, MAX_GROUP_ADDR, check_ga, Application
-from cbus.paho_asyncio import AsyncioHelper
+from cbus.common import (
+    MIN_GROUP_ADDR, MAX_GROUP_ADDR, check_ga, Application, CONFIRMATION_CODES)
+from cbus.daemon.recovery import maintain_cbus_connection, log_health
 from cbus.protocol.pciprotocol import PCIProtocol
+from cbus.protocol.application.status_request import StatusRequestSAL
+from cbus.protocol.pm_packet import PointToMultipointPacket
 from cbus.toolkit.cbz import CBZ
 
 
@@ -162,7 +169,9 @@ class CBusHandler(PCIProtocol):
 
     def __init__(self, labels: Optional[Dict[int, Text]], 
                  device_types: Optional[Dict[int, str]] = None, 
-                 *args, lighting_events: bool = False, **kwargs):
+                 *args, lighting_events: bool = False,
+                 link_check_interval: float = 60,
+                 link_probe_timeout: float = 5, **kwargs):
         super().__init__(*args, **kwargs)
         self.labels = (
             labels if labels is not None else {})  # type: Dict[int, Text]
@@ -171,13 +180,120 @@ class CBusHandler(PCIProtocol):
         self.lighting_events = lighting_events
         
         # Queue system
-        self.command_queue = Queue()  # FIFO queue for new commands
+        self.command_queue = Queue(maxsize=256)
         self.retry_queue = deque()  # Priority queue for retries (FIFO within retries)
         self.pending_confirmations = {}  # confirmation_code -> QueuedCommand
         self.queue_processor_task = None
         self.timeout_watchdog_task = None
         self.queue_lock = None  # Will be initialized as asyncio.Lock when loop is available
         self._queue_running = False
+        self._tasks = set()
+        self._connection_started = False
+        self._recovering = False
+        self.link_check_interval = link_check_interval
+        self.link_probe_timeout = link_probe_timeout
+        self._probe_code = None
+        self._probe_future = None
+        self.last_rx_time = None
+        self.last_probe_time = None
+
+    def _start_task(self, coroutine, name):
+        task = create_task(coroutine, name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._task_finished)
+        return task
+
+    def _task_finished(self, task):
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error('C-Bus background task %s failed', task.get_name(),
+                         exc_info=task.exception())
+            self.request_recovery('background task failure')
+
+    def connection_made(self, transport):
+        self._connection_started = True
+        try:
+            super().connection_made(transport)
+        except Exception:
+            logger.exception('C-Bus PCI initialisation failed')
+            self.request_recovery('PCI initialisation failed')
+            return
+        # Queue lifetime belongs to the C-Bus link, independently of MQTT.
+        self.start_queue_system()
+        if self.link_check_interval > 0:
+            self._start_task(self._link_monitor(), 'cbus-link-monitor')
+
+    def data_received(self, data):
+        self.last_rx_time = time.monotonic()
+        try:
+            super().data_received(data)
+        except Exception:
+            # A bad/unsupported frame must not remain at the head of the buffer
+            # and prevent every later physical switch command from decoding.
+            self._buf.clear()
+            logger.exception('C-Bus input processing failed; dropped buffered input')
+
+    def request_recovery(self, reason):
+        if self._recovering or self._transport is None:
+            return
+        self._recovering = True
+        logger.warning('C-Bus recovery requested: %s', reason)
+        self._transport.abort()
+
+    def on_pci_power_up(self):
+        self.request_recovery('PCI power-up notification; reinitialisation required')
+
+    def _get_confirmation_code(self):
+        # A five-second probe can overlap enough commands to wrap the code
+        # alphabet. Never reuse its code or a pending lighting command's code.
+        for _ in CONFIRMATION_CODES:
+            code = super()._get_confirmation_code()
+            if code != self._probe_code and code not in self.pending_confirmations:
+                return code
+        raise RuntimeError('All PCI confirmation codes are in use')
+
+    async def _link_monitor(self):
+        failures = 0
+        while True:
+            await sleep(self.link_check_interval)
+            self._probe_future = get_event_loop().create_future()
+            try:
+                # Read-only request: never send a lighting on/off/ramp as a
+                # health probe. Its status replies do not enter lighting events.
+                self._probe_code = self._send(PointToMultipointPacket(
+                    sals=StatusRequestSAL(
+                        child_application=Application.LIGHTING,
+                        level_request=True, group_address=0)))
+                answered = await asyncio.wait_for(
+                    self._probe_future, self.link_probe_timeout)
+            except (OSError, asyncio.TimeoutError):
+                answered = False
+            finally:
+                if self._probe_future is not None and not self._probe_future.done():
+                    self._probe_future.cancel()
+                self._probe_code = None
+                self._probe_future = None
+            if answered:
+                self.last_probe_time = time.monotonic()
+                if failures:
+                    logger.info('C-Bus PCI probe responding again')
+                failures = 0
+            else:
+                failures += 1
+                logger.warning('C-Bus PCI probe unanswered or rejected (%s/2)', failures)
+                if failures >= 2:
+                    self.request_recovery('two failed PCI probes')
+                    return
+
+    async def shutdown(self):
+        self.stop_queue_system()
+        tasks = set(self._tasks)
+        if self._timesync_task is not None:
+            tasks.add(self._timesync_task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
     def _publish_lighting_event(self, event, source_addr, group_addr, **kwargs):
@@ -242,7 +358,19 @@ class CBusHandler(PCIProtocol):
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
         """Called when CBUS connection is lost - stop queue system."""
+        logger.warning('C-Bus connection lost (%s)',
+                       type(exc).__name__ if exc is not None else 'EOF/closed')
         self.stop_queue_system()
+        for task in self._tasks:
+            task.cancel()
+        dropped = (self.command_queue.qsize() + len(self.retry_queue)
+                   + len(self.pending_confirmations))
+        if dropped:
+            logger.warning('C-Bus disconnected; discarded %s unconfirmed/queued commands', dropped)
+        self.pending_confirmations.clear()
+        self.retry_queue.clear()
+        while not self.command_queue.empty():
+            self.command_queue.get_nowait()
         super().connection_lost(exc)
 
     # Queue system methods
@@ -270,13 +398,20 @@ class CBusHandler(PCIProtocol):
             is_retry=False
         )
         
-        await self.command_queue.put(cmd)
+        if self._recovering or (self._connection_started and self._transport is None):
+            logger.warning('C-Bus disconnected; rejected command for GA %s', group_addr)
+            return
+        try:
+            self.command_queue.put_nowait(cmd)
+        except QueueFull:
+            logger.warning('C-Bus command queue full; rejected command for GA %s', group_addr)
+            return
         logger.debug(f"Queued command: GA {group_addr} {command_type}")
 
     def _send_queued_command(self, cmd: QueuedCommand) -> Optional[bytes]:
         """
         Sends a queued command to CBUS and returns the confirmation code.
-        This is synchronous - the lighting methods are blocking.
+        Uses the transport's non-blocking write; confirmations arrive later.
         """
         try:
             if cmd.command_type == 'on':
@@ -298,7 +433,6 @@ class CBusHandler(PCIProtocol):
         Processes commands from the queue with 100ms rate limiting.
         Prioritizes retries over new commands.
         """
-        self._queue_running = True
         logger.info("Queue processor started")
         
         # Ensure lock is initialized
@@ -328,7 +462,7 @@ class CBusHandler(PCIProtocol):
                     # Track for confirmation matching
                     async with self.queue_lock:
                         cmd.confirmation_code = confirmation_code
-                        cmd.timestamp = time.time()
+                        cmd.timestamp = time.monotonic()
                         self.pending_confirmations[confirmation_code] = cmd
                     
                     logger.debug(f"Sent command GA {cmd.group_addr} {cmd.command_type}, waiting for confirmation {confirmation_code!r}")
@@ -366,7 +500,7 @@ class CBusHandler(PCIProtocol):
         while self._queue_running:
             await sleep(0.05)  # Check every 50ms
             
-            current_time = time.time()
+            current_time = time.monotonic()
             timed_out = []
             
             async with self.queue_lock:
@@ -401,15 +535,15 @@ class CBusHandler(PCIProtocol):
         """Start the queue processor and timeout watchdog."""
         if self._queue_running:
             return
+        self._queue_running = True
         
         # Initialize queue lock
         from asyncio import Lock
         if self.queue_lock is None:
             self.queue_lock = Lock()
         
-        loop = get_event_loop()
-        self.queue_processor_task = create_task(self._queue_processor())
-        self.timeout_watchdog_task = create_task(self._timeout_watchdog())
+        self.queue_processor_task = self._start_task(self._queue_processor(), 'cbus-commands')
+        self.timeout_watchdog_task = self._start_task(self._timeout_watchdog(), 'cbus-confirmations')
         logger.info("Queue system started")
 
     def stop_queue_system(self):
@@ -427,6 +561,10 @@ class CBusHandler(PCIProtocol):
         """
         # Call parent first (for logging)
         super().on_confirmation(code, success)
+        if code == self._probe_code and self._probe_future is not None:
+            if not self._probe_future.done():
+                self._probe_future.set_result(success)
+            return
         
         # Match confirmation to pending command
         async def handle_confirmation():
@@ -477,36 +615,123 @@ class CBusHandler(PCIProtocol):
                     logger.error(f"Command GA {cmd.group_addr} {cmd.command_type} failed after {cmd.max_retries} retries")
                     # Don't update Home Assistant state - it stays as-is
         
-        # Schedule in event loop (since we're in callback context)
-        try:
-            loop = get_event_loop()
-            if loop.is_running():
-                # Schedule async function
-                asyncio.ensure_future(handle_confirmation(), loop=loop)
-            else:
-                # If loop not running, try to run it
-                try:
-                    loop.run_until_complete(handle_confirmation())
-                except RuntimeError:
-                    # Loop already running in another thread, schedule it
-                    asyncio.ensure_future(handle_confirmation())
-        except RuntimeError:
-            # No event loop available, try to get/create one
-            try:
-                loop = get_event_loop()
-                asyncio.ensure_future(handle_confirmation(), loop=loop)
-            except RuntimeError:
-                logger.error("Cannot schedule confirmation handler: no event loop available")
+        self._start_task(handle_confirmation(), 'cbus-confirmation-callback')
 
 
 class MqttClient(mqtt.Client):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bridge_handler = kwargs.get('userdata')
+        self._config_handler = self.bridge_handler
+        self._asyncio_loop = None
+        self._stopping = False
+        self._state_cache = {}
+        self._publish_failed = False
+        self._offline_events = 0
+        self.network_failure = None
+        self.subscriptions_ready = False
+        self.max_queued_messages_set(1024)
+
+    def start(self, loop, host, port, keepalive):
+        self._asyncio_loop = loop
+        self.network_failure = loop.create_future()
+        self.reconnect_delay_set(min_delay=1, max_delay=60)
+        self.connect_async(host, port, keepalive)
+        logger.info('Starting MQTT connection; automatic retry backoff 1–60 seconds')
+        # This is the only MQTT network driver. Never install AsyncioHelper
+        # alongside loop_start(). DNS/TCP/TLS and retries run off asyncio.
+        self.loop_start()
+
+    def attach_handler(self, handler):
+        self.bridge_handler = handler
+        if handler is not None:
+            handler.mqtt_api = self
+            self._config_handler = handler
+
+    def _dispatch(self, callback, *args):
+        if self._stopping:
+            return
+        if self._asyncio_loop is None:
+            self._invoke(callback, args)
+        elif not self._asyncio_loop.is_closed():
+            self._asyncio_loop.call_soon_threadsafe(self._invoke, callback, args)
+
+    def _invoke(self, callback, args):
+        if self._stopping:
+            return
+        try:
+            callback(*args)
+        except Exception:
+            # User payload/callback failures must never terminate Paho's thread.
+            logger.exception('MQTT application callback %s failed',
+                             getattr(callback, '__name__', type(callback).__name__))
+
+    def _thread_main(self):
+        try:
+            super()._thread_main()
+        except Exception:
+            logger.exception('MQTT network thread failed')
+        finally:
+            if not self._stopping:
+                self._dispatch(self._network_stopped)
+
+    def _network_stopped(self):
+        if self.network_failure is not None and not self.network_failure.done():
+            self.network_failure.set_result(True)
+
+    async def stop(self, timeout=5):
+        self._stopping = True
+        self.disconnect()
+        # loop_stop joins a network thread. A stalled system DNS resolver must
+        # not trap asyncio or its default executor during process shutdown.
+        stopper = threading.Thread(target=self.loop_stop, daemon=True,
+                                   name='mqtt-shutdown')
+        stopper.start()
+        deadline = time.monotonic() + timeout
+        while stopper.is_alive() and time.monotonic() < deadline:
+            await sleep(0.01)
+        if stopper.is_alive():
+            logger.warning('MQTT network thread still finishing connection I/O; shutdown wait expired')
+
+    def on_log(self, client, userdata, level, message):
+        # Paho 1.5 reports failed attempts only at DEBUG. Promote this specific
+        # transition without enabling packet/payload/credential logging.
+        if message == 'Connection failed, retrying':
+            self._dispatch(logger.warning, 'MQTT connection attempt failed; retrying automatically')
+
+    def on_disconnect(self, client, userdata, rc, properties=None):
+        self._dispatch(self._handle_disconnect, rc)
+
+    def _handle_disconnect(self, rc):
+        self.subscriptions_ready = False
+        logger.warning('MQTT disconnected (rc=%s); retrying automatically', rc)
+
+    def on_subscribe(self, client, userdata, mid, granted_qos, properties=None):
+        self._dispatch(self._handle_subscribe, mid, granted_qos)
+
+    def _handle_subscribe(self, mid, granted_qos):
+        self.subscriptions_ready = False
+        if any(qos >= 128 for qos in granted_qos):
+            logger.error('MQTT broker rejected command subscriptions (mid=%s)', mid)
+        else:
+            self.subscriptions_ready = True
+            logger.info('MQTT command subscriptions restored')
+
     def on_connect(self, client, userdata: CBusHandler, flags, rc):
+        self._dispatch(self._handle_connect, userdata, flags, rc)
+
+    def _handle_connect(self, userdata, flags, rc):
+        self.subscriptions_ready = False
+        if rc != mqtt.CONNACK_ACCEPTED:
+            logger.warning('MQTT connection refused (rc=%s); retrying automatically', rc)
+            return
         logger.info('Connected to MQTT broker')
+        self._publish_failed = False
+        userdata = self._config_handler if self._asyncio_loop is not None else userdata
+        if userdata is None:
+            return
         userdata.mqtt_api = self
-        
-        # Start queue system
-        userdata.start_queue_system()
         
         # Subscribe to set topics for all device types (except ignored and binary sensors)
         topics = []
@@ -526,11 +751,30 @@ class MqttClient(mqtt.Client):
             # Also subscribe to switch topics (Home Assistant might send commands to these)
             topics.append((_SWITCH_TOPIC_PREFIX + str(ga) + _TOPIC_SET_SUFFIX, 2))
         
-        self.subscribe(topics)
+        if topics:
+            rc, _ = self.subscribe(topics)
+            if rc != mqtt.MQTT_ERR_SUCCESS:
+                logger.warning('MQTT subscription restoration failed (rc=%s)', rc)
+        else:
+            self.subscriptions_ready = True
         self.publish_all_lights(userdata.labels, userdata.device_types)
+        for topic, payload in self._state_cache.copy().items():
+            self._publish_raw(topic, payload)
+        if self._offline_events:
+            logger.warning('MQTT restored; %s live lighting events were unavailable during outage',
+                           self._offline_events)
+            self._offline_events = 0
 
     def on_message(self, client, userdata: CBusHandler, msg: mqtt.MQTTMessage):
+        self._dispatch(self._handle_message, userdata, msg)
+
+    def _handle_message(self, userdata, msg):
         """Handle a message from an MQTT subscription."""
+        if self._asyncio_loop is not None:
+            userdata = self.bridge_handler
+            if userdata is None or userdata._transport is None or userdata._recovering:
+                logger.warning('C-Bus disconnected; rejected MQTT command')
+                return
         # Check if it's a set topic (any device type)
         if not msg.topic.endswith(_TOPIC_SET_SUFFIX):
             return
@@ -583,8 +827,15 @@ class MqttClient(mqtt.Client):
             logging.error(f'Unexpected error parsing payload in {msg.topic}: {e}', exc_info=e)
             return
 
-        light_on = payload['state'].upper() == 'ON'
-        brightness = int(payload.get('brightness', 255))
+        try:
+            if not isinstance(payload, dict) or payload.get('state', '').upper() not in ('ON', 'OFF'):
+                raise ValueError('state must be ON or OFF')
+            light_on = payload['state'].upper() == 'ON'
+            brightness = int(payload.get('brightness', 255))
+            transition_time = int(payload.get('transition', 0))
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            logger.warning('Invalid MQTT lighting command on %s', msg.topic)
+            return
 
         # Clamp brightness for non-dimmable lights and switches
         if device_type in (_DEVICE_TYPE_LIGHT_NON_DIMMABLE, _DEVICE_TYPE_SWITCH):
@@ -597,7 +848,6 @@ class MqttClient(mqtt.Client):
             if brightness > 255:
                 brightness = 255
 
-        transition_time = int(payload.get('transition', 0))
         if transition_time < 0:
             transition_time = 0
 
@@ -655,30 +905,26 @@ class MqttClient(mqtt.Client):
                     await userdata.queue_command(
                         'off', ga, device_type, {}, mqtt_state)
         
-        # Schedule command in event loop (on_message is sync callback)
-        try:
-            loop = get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(enqueue_command(), loop=loop)
-            else:
-                # Try to run it
-                try:
-                    loop.run_until_complete(enqueue_command())
-                except RuntimeError:
-                    # Loop already running, schedule it
-                    asyncio.ensure_future(enqueue_command())
-        except RuntimeError:
-            # No event loop available
-            try:
-                loop = get_event_loop()
-                asyncio.ensure_future(enqueue_command(), loop=loop)
-            except RuntimeError:
-                logger.error(f"Cannot queue command GA {ga}: no event loop available")
+        userdata._start_task(enqueue_command(), 'cbus-enqueue-command')
 
     def publish(self, topic: Text, payload: Dict[Text, Any]):
         """Publishes a payload as JSON."""
         payload = json.dumps(payload)
-        return super().publish(topic, payload, 1, True)
+        return self._publish_raw(topic, payload)
+
+    def _publish_raw(self, topic, payload, qos=1, retain=True):
+        if retain and topic.endswith(_TOPIC_STATE_SUFFIX):
+            self._state_cache[topic] = payload
+        if self._asyncio_loop is not None and not self.is_connected():
+            info = mqtt.MQTTMessageInfo(0)
+            info.rc = mqtt.MQTT_ERR_NO_CONN
+        else:
+            info = super().publish(topic, payload, qos=qos, retain=retain)
+        if isinstance(info.rc, int) and info.rc != mqtt.MQTT_ERR_SUCCESS:
+            if not self._publish_failed:
+                logger.warning('MQTT publish unavailable (rc=%s); latest states cached, live events cannot be replayed from state', info.rc)
+                self._publish_failed = True
+        return info
 
     def publish_lighting_event(self, event: str, source_addr: int,
                                group_addr: int, duration: Optional[int] = None,
@@ -693,7 +939,14 @@ class MqttClient(mqtt.Client):
         if event == 'ramp':
             payload.update(level=level, duration=duration)
         # Do not use self.publish(): discovery and state intentionally retain.
-        return super().publish(
+        if self._asyncio_loop is not None and not self.is_connected():
+            self._offline_events += 1
+            if self._offline_events == 1:
+                logger.warning('MQTT offline; live lighting event unavailable')
+            info = mqtt.MQTTMessageInfo(0)
+            info.rc = mqtt.MQTT_ERR_NO_CONN
+            return info
+        return self._publish_raw(
             _LIGHTING_EVENT_TOPIC_PREFIX + str(group_addr),
             json.dumps(payload), qos=1, retain=False)
 
@@ -815,8 +1068,7 @@ class MqttClient(mqtt.Client):
 
     def publish_binary_sensor(self, group_addr: int, state: bool):
         payload = 'ON' if state else 'OFF'
-        return super().publish(
-            bin_sensor_state_topic(group_addr), payload, 1, True)
+        return self._publish_raw(bin_sensor_state_topic(group_addr), payload)
 
     def lighting_group_on(self, source_addr: Optional[int], group_addr: int,
                           device_type: Optional[str] = None):
@@ -834,7 +1086,7 @@ class MqttClient(mqtt.Client):
         # Switches need plain string state updates, lights need JSON
         if device_type == _DEVICE_TYPE_SWITCH:
             # Publish plain string for switches
-            super().publish(state_topic_str, 'ON', 1, True)
+            self._publish_raw(state_topic_str, 'ON')
         else:
             # Publish JSON for lights
             payload = {
@@ -866,7 +1118,7 @@ class MqttClient(mqtt.Client):
         # Switches need plain string state updates, lights need JSON
         if device_type == _DEVICE_TYPE_SWITCH:
             # Publish plain string for switches
-            super().publish(state_topic_str, 'OFF', 1, True)
+            self._publish_raw(state_topic_str, 'OFF')
         else:
             # Publish JSON for lights
             payload = {
@@ -899,7 +1151,7 @@ class MqttClient(mqtt.Client):
         # Switches need plain string state updates, lights need JSON
         if device_type == _DEVICE_TYPE_SWITCH:
             # Publish plain string for switches
-            super().publish(state_topic_str, state, 1, True)
+            self._publish_raw(state_topic_str, state)
         else:
             # Publish JSON for lights
             payload = {
@@ -1047,6 +1299,12 @@ async def _main():
         help='IP address and TCP port where the C-Bus CNI or PCI is located '
              '(eg: -t 192.0.2.1:10001)')
 
+    group = parser.add_argument_group('Connection health')
+    group.add_argument(
+        '--link-check-interval', type=float, default=60, metavar='SECONDS',
+        help='Interval between acknowledged read-only PCI probes (0 disables). '
+             '[default: %(default)s seconds]')
+
     group = parser.add_argument_group('Time settings')
     group.add_argument(
         '-T', '--timesync', metavar='SECONDS',
@@ -1097,6 +1355,10 @@ async def _main():
              '(no MQTT discovery or subscriptions, e.g., "5,15,25")')
 
     option = parser.parse_args()
+    if option.broker_keepalive <= 0:
+        parser.error('--broker-keepalive must be positive for failure detection')
+    if option.link_check_interval < 0:
+        parser.error('--link-check-interval must be non-negative')
 
     if bool(option.broker_client_cert) != bool(option.broker_client_key):
         return parser.error(
@@ -1104,16 +1366,14 @@ async def _main():
 
     global_logger = logging.getLogger('cbus')
     global_logger.setLevel(option.verbosity)
-    logging.basicConfig(level=option.verbosity, filename=option.log)
+    logging.basicConfig(level=option.verbosity, filename=option.log,
+                        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+                        force=True)
     
-    # Ensure the module logger (cbus.daemon.cmqttd) inherits the correct level
-    # This fixes queue system logs not appearing - the module logger is created
-    # at import time (line 42) before basicConfig is called, so we need to
-    # explicitly ensure it has the right level
+    # Also cover execution as __main__, outside the cbus logger hierarchy.
     logger.setLevel(option.verbosity)
 
     loop = get_event_loop()
-    connection_lost_future = loop.create_future()
     labels = (read_cbz_labels(option.project_file)
               if option.project_file else None)
 
@@ -1141,21 +1401,26 @@ async def _main():
         return CBusHandler(
             timesync_frequency=option.timesync,
             handle_clock_requests=not option.no_clock,
-            connection_lost_future=connection_lost_future,
+            connection_lost_future=loop.create_future(),
             labels=labels,
             device_types=device_types,
             lighting_events=option.lighting_events,
+            link_check_interval=option.link_check_interval,
         )
 
     if option.serial:
-        _, protocol = await create_serial_connection(
-            loop, factory, option.serial, baudrate=9600)
-    elif option.tcp:
-        addr = option.tcp.split(':', 2)
-        _, protocol = await loop.create_connection(
-            factory, addr[0], int(addr[1]))
+        async def connect(protocol_factory):
+            return await create_serial_connection(
+                loop, protocol_factory, option.serial, baudrate=9600)
+    else:
+        addr, tcp_port = option.tcp.rsplit(':', 1)
+        async def connect(protocol_factory):
+            return await loop.create_connection(protocol_factory, addr, int(tcp_port))
 
-    mqtt_client = MqttClient(userdata=protocol)
+    # Metadata is available for discovery even if the first C-Bus connection
+    # fails. Only a successfully connected protocol accepts MQTT commands.
+    mqtt_client = MqttClient(userdata=factory())
+    mqtt_client.attach_handler(None)
     if option.broker_auth:
         read_auth(mqtt_client, option.broker_auth)
     if option.broker_disable_tls:
@@ -1171,10 +1436,42 @@ async def _main():
         mqtt_client.tls_set(**tls_args)
         port = option.broker_port or 8883
 
-    aioh = AsyncioHelper(loop, mqtt_client)
-    mqtt_client.connect(option.broker_address, port, option.broker_keepalive)
+    stopping = asyncio.Event()
 
-    await connection_lost_future
+    def request_shutdown():
+        logger.info('Shutdown requested')
+        stopping.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, request_shutdown)
+    # Stack traces contain no payloads or credential values. Signal the Python
+    # process itself (not the container's init process) when diagnosing a stall.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    tasks = []
+    try:
+        mqtt_client.start(loop, option.broker_address, port, option.broker_keepalive)
+        tasks = [
+            create_task(maintain_cbus_connection(factory, connect, mqtt_client)),
+            create_task(log_health(mqtt_client)),
+            create_task(stopping.wait()),
+        ]
+        done, _ = await asyncio.wait(
+            tasks + [mqtt_client.network_failure], return_when=asyncio.FIRST_COMPLETED)
+        if mqtt_client.network_failure in done:
+            raise RuntimeError('MQTT network driver stopped unexpectedly')
+        for task in done:
+            task.result()
+        if not stopping.is_set():
+            raise RuntimeError('Bridge supervisor stopped unexpectedly')
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await mqtt_client.stop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
+        faulthandler.unregister(signal.SIGUSR1)
+        logger.info('Bridge shutdown complete')
 
 
 def main():

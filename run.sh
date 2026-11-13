@@ -18,6 +18,7 @@ LIGHTING_EVENTS=$(jq -r '.mqtt.lighting_events // false' $CONFIG_PATH)
 CBUS_CONNECTION_TYPE=$(jq -r '.cbus.cbus_connection_type // "tcp"' $CONFIG_PATH)
 CBUS_CONNECTION_STRING=$(jq -r '.cbus.cbus_connection_string // "192.168.1.50:10001"' $CONFIG_PATH)
 CBUS_TIMESYNC=$(jq -r '.cbus.cbus_timesync // 300' $CONFIG_PATH)
+LINK_CHECK_INTERVAL=$(jq -r '.cbus.link_check_interval // 60' $CONFIG_PATH)
 PROJECT_FILE_PATH=$(jq -r '.cbus.project_file_path // ""' $CONFIG_PATH)
 NON_DIMMABLE_LIGHTS=$(jq -r '.ga.non_dimmable_lights // ""' $CONFIG_PATH)
 SWITCHES=$(jq -r '.ga.switches // ""' $CONFIG_PATH)
@@ -37,7 +38,7 @@ if [ -n "${MQTT_USERNAME}" ] && [ -n "${MQTT_PASSWORD}" ]; then
 fi
 
 # Build command arguments
-CMQTTD_ARGS="--broker-address ${MQTT_BROKER}"
+CMQTTD_ARGS="--broker-address ${MQTT_BROKER} --link-check-interval ${LINK_CHECK_INTERVAL}"
 
 if [ "${LIGHTING_EVENTS}" = "true" ]; then
     CMQTTD_ARGS="${CMQTTD_ARGS} --lighting-events"
@@ -122,5 +123,5 @@ echo "Current time: $(date -R)"
 echo "Starting cmqttd with arguments: ${CMQTTD_ARGS}"
 
 # Execute cmqttd
-exec python3 -m cbus.daemon.cmqttd ${CMQTTD_ARGS}
+exec python3 -u -m cbus.daemon.cmqttd ${CMQTTD_ARGS}
 
