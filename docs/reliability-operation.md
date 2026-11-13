@@ -1,9 +1,10 @@
-# Reliability candidate: operation, diagnostics and rollback
+# Connection reliability v1.0.5: operation, diagnostics and rollback
 
-The test candidate is **1.0.5-rc1**, based on production **1.0.4** at
+Version **1.0.5** builds on the original stable **1.0.4** source at
 `7dd4d5048a1df4c45c2f945119c3fe231dcfe7f2`. Read
 [the source comparison](reliability-investigation.md) before deployment.
-Nothing in this change deploys to Home Assistant or merges master.
+The original **1.0.5-rc1** trial procedure below is retained as historical guidance.
+Merging GitHub code does not automatically replace an installed Home Assistant add-on.
 
 ## Changed behavior
 
@@ -60,7 +61,7 @@ repaired without restarting the daemon.
 ## Before any installation
 
 1. Keep the production add-on installed, its current image cached, and its
-   current v1.0.4 options available. Do not upgrade or uninstall that copy.
+   current options available for rollback. Do not uninstall the known-good copy.
    Make a Home Assistant backup including the add-on and securely export its
    options. Those options contain MQTT credentials; do not paste them into logs,
    issue comments or shell command arguments.
@@ -71,11 +72,16 @@ repaired without restarting the daemon.
 3. Preserve the baseline Git commit above (also held on the rollback branch).
    Its source archive is available from GitHub:
    `https://github.com/Warren2006/cbus2ha/archive/7dd4d5048a1df4c45c2f945119c3fe231dcfe7f2.tar.gz`.
-4. Require the PR's Docker build and regression checks to pass before installing.
+4. Check that the release's Docker build and regression checks pass before installing.
    Local Docker package downloads may be restricted by the development network;
    local Python/loopback success is not proof of a completed production image.
 
-## Safe test installation
+## Original staged trial installation (1.0.5-rc1; historical)
+
+These are the original test-candidate steps, retained for reference rather than
+instructions to reinstall a retired candidate. For a new v1.0.5 installation,
+use the stable repository on `master`, with an existing-installation backup and
+only one bridge active at a time.
 
 Use a local add-on on a test Home Assistant instance first. To build the candidate
 without changing the original repository installation:
@@ -112,8 +118,9 @@ settings; no change here instructs automatic HA deployment.
 
 ## Immediate rollback
 
-Stop **1.0.5-rc1**, disable its automatic startup, then start the retained
-production **1.0.4** add-on with its original options. Restore the original
+Stop **1.0.5** (or an older **1.0.5-rc1** trial), disable its automatic
+startup, then start the retained known-good **1.0.4** add-on with its original
+options. Restore the original
 start-on-boot preference. Since discovery identifiers, topics and payloads are
 unchanged, entity re-creation should not be necessary. Observe normal light
 control and a physical Saturn command before leaving the system unattended.
@@ -148,12 +155,16 @@ moving master branch during an outage.
 
 ## Limits and unverified assumptions
 
-No physical Saturn, CNI, PCI, USB unplug/replug, firmware, actual HA Supervisor
-or months-long soak has been tested. The loopback CNI acknowledges valid requests
-as expected from the protocol; real PCI confirmation behavior and serial driver
-behavior must be confirmed during the staged trial. Disable probes with zero if
-an interface proves incompatible, then capture diagnostics before deciding on a
-different probe/recovery method.
+The original automated tests did not cover physical Saturn switches or a physical
+CNI/PCI. Subsequent Home Assistant field logs from 8–13 November 2026 showed
+four successful watchdog-triggered TCP reconnections, confirming practical PCI
+probe/recovery behavior on that installation. The operator reported no need for
+manual Home Assistant restarts to restore C-Bus. This does not establish the
+cause of the intermittent interface faults or validate every hardware model.
+USB unplug/replug, serial driver hangs, firmware variations and months-long
+unattended operation remain unverified. Disable probes with zero only if an
+interface proves incompatible, then capture diagnostics before choosing a
+different recovery method.
 
 There is an inherited low-level serial limitation: pyserial-asyncio 0.4 and 0.6
 call `serial.flush()` synchronously when closing a transport. A kernel/USB driver
